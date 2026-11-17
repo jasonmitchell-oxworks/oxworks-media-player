@@ -162,6 +162,7 @@ if (isset($_GET['fetch'])) {
 
     function unloadVideo(vid) {
         unbind(vid);
+        vid._preloadedSrc = null;
         vid.pause();
         vid.removeAttribute('src');
         vid.load(); // releases the hardware decoder on TV browsers
@@ -184,11 +185,14 @@ if (isset($_GET['fetch'])) {
         currentElement = nextEl;
 
         if (prevEl && prevEl !== nextEl) {
+            // _cleanupTimer is nulled once it has run, so "has a pending cleanup" is just a truthy check.
             prevEl._cleanupTimer = setTimeout(() => {
+                prevEl._cleanupTimer = null;
                 if (prevEl === currentElement) return;
                 prevEl.classList.remove('active');
                 if (prevEl.tagName === 'VIDEO') {
                     prevEl._cleanupTimer = setTimeout(() => {
+                        prevEl._cleanupTimer = null;
                         if (prevEl !== currentElement) unloadVideo(prevEl);
                     }, fadeDurationMs + 100);
                 }
@@ -202,8 +206,43 @@ if (isset($_GET['fetch'])) {
         currentElement = null;
         el.classList.remove('active');
         if (el.tagName === 'VIDEO') {
-            el._cleanupTimer = setTimeout(() => unloadVideo(el), fadeDurationMs + 100);
+            el._cleanupTimer = setTimeout(() => {
+                el._cleanupTimer = null;
+                unloadVideo(el);
+            }, fadeDurationMs + 100);
         }
+    }
+
+    // Warm up the next item while the current one is on screen, so it cuts in without a loading gap.
+    // Images: fetched into the HTTP cache. Videos: buffered (paused) on the idle layer's <video>, but only
+    // while an IMAGE is showing, because some TV browsers have a single hardware video decoder.
+    let warmImage = null;
+    function preloadNext(myToken) {
+        if (!playlist.length) return;
+        const next = playlist[currentIndex < playlist.length ? currentIndex : 0];
+
+        if (next.type === 'image') {
+            warmImage = new Image();
+            warmImage.src = next.src;
+            return;
+        }
+        if (next.type !== 'video' || !currentElement || currentElement.tagName !== 'IMG') return;
+
+        const vid = layers[activeLayer === 0 ? 1 : 0].vid; // the layer playNext() will pick next
+        const attempt = () => {
+            if (myToken !== token || vid._preloadedSrc === next.src) return;
+            if (vid === currentElement || vid._cleanupTimer) {
+                later(myToken, attempt, 250); // still fading out / unloading the previous video
+                return;
+            }
+            unbind(vid);
+            vid.muted = true;
+            vid.preload = 'auto';
+            vid._preloadedSrc = next.src;
+            vid.src = next.src;
+            vid.load();
+        };
+        attempt();
     }
 
     let toastTimer = null;
@@ -262,6 +301,13 @@ if (isset($_GET['fetch'])) {
         activeLayer = activeLayer === 0 ? 1 : 0;
         const targetLayer = layers[activeLayer];
 
+        // Playlist changed under a background preload: free that buffer/decoder rather than leave it parked.
+        const parked = targetLayer.vid;
+        if (parked._preloadedSrc && parked !== currentElement && !parked._cleanupTimer
+            && !(item.type === 'video' && item.src === parked._preloadedSrc)) {
+            unloadVideo(parked);
+        }
+
         // Exactly one hand-off per item, however many events/timeouts fire.
         let done = false;
         const finish = (delay, reason) => {
@@ -282,6 +328,7 @@ if (isset($_GET['fetch'])) {
                 clearTimeout(loadTimer);
                 crossfadeTo(img);
                 finish(item.duration);
+                preloadNext(myToken);
             };
             const decodeThenShow = () => {
                 if (img.decode) img.decode().catch(() => {}).then(show);
@@ -315,6 +362,7 @@ if (isset($_GET['fetch'])) {
                 crossfadeTo(vid);
                 // crossfadeTo() unbinds; re-attach the in-play handlers.
                 bind(vid, handlers);
+                preloadNext(myToken); // only warms a following image; never a 2nd video while one plays
                 lastProgressAt = Date.now();
                 every(myToken, () => {
                     if (done) return;
@@ -359,8 +407,15 @@ if (isset($_GET['fetch'])) {
             };
 
             bind(vid, handlers);
-            vid.src = item.src;
-            vid.load();
+            if (vid._preloadedSrc === item.src && !vid.error) {
+                // Buffered in the background while the previous image was showing.
+                if (vid.readyState >= 2) startPlayback(); // HAVE_CURRENT_DATA: go now
+                // else: still buffering; loadeddata/canplay will fire into the handlers just bound.
+            } else {
+                vid._preloadedSrc = null;
+                vid.src = item.src;
+                vid.load();
+            }
 
         } else {
             clearTimeout(loadTimer);

@@ -36,6 +36,7 @@ media.oxworks.com.au/
 ## Player (`index.php`) — how it works
 - Dual-layer A/B buffer (`img-0/1`, `vid-0/1`). The incoming layer fades in **on top** (rising `z-index`) while the outgoing one stays fully opaque underneath, so there's no dip to black. The outgoing layer is hidden, and videos unloaded (`pause()` / `removeAttribute('src')` / `load()`), only after the fade, and **only if that element hasn't been reclaimed in the meantime** (`claim()` cancels pending cleanup). Don't remove this guard: without it a reused video element gets unloaded mid-play and the screen freezes.
 - Every item gets a `token`. Stale event handlers and timers compare against it, and `finish()` guarantees exactly one hand-off per item. All control flow goes through `later()` / `every()` / `finish()`; never call `playNext()` directly from an event.
+- Preloading (`preloadNext()`): once an item is on screen, the next one is warmed up. A next image is fetched into the HTTP cache. A next video is buffered (paused, muted) on the idle layer's `<video>`, tagged with `_preloadedSrc`, and `playNext()` starts it straight away if `readyState >= 2`. Video preloading only happens **while an image is showing**: some TV browsers have a single hardware decoder, so never buffer a second video while one plays. It waits for any pending fade-out/unload on that element (`_cleanupTimer` is nulled after it runs, so it doubles as a "busy" flag). If the playlist changes and a parked preload isn't used, it's unloaded.
 - Watchdogs: 20s load timeout per item, 15s no-progress stall detector on playing videos.
 - Videos hand off `min(fade, duration/3)` before the end.
 - Polls `?fetch=1` (no-store) at the end of every loop. An empty playlist fades to black. A fetch failure keeps the last playlist.
@@ -55,6 +56,11 @@ media.oxworks.com.au/
 ## Testing notes
 - Local: `php -S 127.0.0.1:8765` in the project root, then drive it with Playwright. Headless Chromium can't play H.264, so use VP8/VP9 WebM fixtures (`ffmpeg -f lavfi -i testsrc=duration=3:size=640x360 -c:v libvpx clip.webm`).
 - Regression cases worth keeping: video → 500ms image → video with a 1000ms fade (old freeze bug), a hung video request (watchdog), a file deleted mid-loop, an empty library, a corrupted settings.json, an A↔B rename swap, and refreshing after a save.
+- Preload check: throttle with CDP `Network.emulateNetworkConditions` (~350 KB/s) and measure how long the image before a video stays up. It should match its configured duration, not duration + video load time.
+
+## Media guidance
+- Videos: H.264 High, 1080p, ~6 Mbps cap, AAC, `+faststart`. Phone/camera exports at 15-20 Mbps make TVs buffer for no visible gain:
+  `ffmpeg -i in.mp4 -c:v libx264 -preset slow -crf 22 -maxrate 6M -bufsize 12M -profile:v high -level 4.1 -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart out.mp4`
 
 ## Possible future work
 - Scheduling (date/time windows per item).
